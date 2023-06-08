@@ -1,0 +1,31 @@
+[package]
+name = "cpc-gpio-bridge"
+version = "1.0.0"
+edition = "2021"
+description = "Provides the ability to expose general purpose I/O's from a microcontroller to the Linux GPIO subsystem"
+repository = "https://github.com/SiliconLabs/cpc-gpio-expander"
+keywords = ["gpio", "cpc", "siliconlabs"]
+license-file = "LICENSE"
+
+[dependencies]
+anyhow = { version = "1.0.71", features = ["backtrace"] }
+bincode = "1.3.3"
+clap = { version = "4.2.7", features = ["derive"] }
+env_logger = "0.10.0"
+file-lock = "2.1.9"
+libcpc = { path = "../../cpc/daemon/lib/bindings/rust/libcpc" }
+log = "0.4.17"
+mio = "0.8.6"
+mio-signals = "0.2.0"
+neli = "0.6.4"
+nom = "7.1.3"
+num_enum = "0.6.1"
+serde = { version = "1.0.163", features = ["derive"] }
+serde_repr = "0.1.12"
+thiserror = "1.0.40"
+
+[dev-dependencies]
+gpiod = "0.2.3"
+serial_test = "2.0.0"
+telnet = "0.2.1"
+toml = "0.7.3"
