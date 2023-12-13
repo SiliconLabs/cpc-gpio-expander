@@ -1,7 +1,7 @@
 use mio_signals::{Signal, Signals};
 
 mod driver;
-mod endpoint;
+mod gpio;
 mod router;
 mod utils;
 
@@ -16,43 +16,37 @@ fn main() -> ! {
         .init();
 
     log::info!(
-        "[CPC GPIO Bridge v{}] [Endpoint API v{}] [Driver API v{}]",
+        "[CPC GPIO Bridge v{}] [GPIO API v{}] [Driver API v{}]",
         env!("CARGO_PKG_VERSION"),
-        endpoint::VERSION,
+        gpio::VERSION,
         driver::VERSION
     );
 
     log::info!("{:?}", config);
 
-    let lock_file = std::path::Path::new(&config.lock_dir)
-        .join(format!("cpc-gpio-bridge-{}.lock", config.instance));
+    let run = || {
+        let lock_file = std::path::Path::new(&config.lock_dir)
+            .join(format!("cpc-gpio-bridge-{}.lock", config.instance));
 
-    let _bridge_lock = match utils::lock_bridge(&lock_file) {
-        Ok(bridge_lock) => bridge_lock,
-        Err(err) => utils::exit(err),
+        let _bridge_lock = utils::lock_bridge(&lock_file)?;
+
+        let signals = Signals::new(Signal::Interrupt | Signal::Terminate | Signal::User1)?;
+
+        let gpio = gpio::Handle::new(&config, &trace_config)?;
+
+        let driver = driver::Handle::new(
+            config.deinit,
+            gpio.chip.unique_id,
+            &gpio.chip.label,
+            &gpio.chip.gpio_names,
+        )?;
+
+        router::process_loop(signals, driver, gpio)?;
+
+        Ok(())
     };
 
-    let mut signals = match Signals::new(Signal::Interrupt | Signal::Terminate) {
-        Ok(signals) => signals,
-        Err(err) => utils::exit(err.into()),
-    };
-
-    let mut endpoint = match endpoint::Endpoint::new(&config.instance, trace_config.libcpc) {
-        Ok(endpoint) => endpoint,
-        Err(err) => utils::exit(err),
-    };
-
-    let mut driver = match driver::Driver::new(
-        config.deinit,
-        endpoint.gpio_chip.unique_id,
-        &endpoint.gpio_chip.chip_label,
-        &endpoint.gpio_chip.gpio_names,
-    ) {
-        Ok(driver) => driver,
-        Err(err) => utils::exit(err),
-    };
-
-    if let Err(err) = router::process_loop(&mut signals, &mut driver, &mut endpoint) {
+    if let Err(err) = run() {
         utils::exit(err);
     }
 

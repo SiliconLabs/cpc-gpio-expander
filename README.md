@@ -13,7 +13,6 @@ Enables the expansion of general purpose I/O's on a Linux system via a Silicon L
   - [Modification](#modification)
 - [Limitations](#limitations)
   - [Interrupts](#interrupts)
-  - [Multiple expanders](#multiple-expanders)
 - [Considerations](#considerations)
   - [Set value feedback](#set-value-feedback)
   - [Initialization sequence](#initialization-sequence)
@@ -23,7 +22,7 @@ Enables the expansion of general purpose I/O's on a Linux system via a Silicon L
 
 ## Features
 * Native implementation using the Linux GPIO kernel/userspace subsystem
-* Compatible with 3rd party libraries ([C](https://archlinux.org/packages/community/x86_64/libgpiod/), [Rust](https://crates.io/crates/gpiod), [Python](https://pypi.org/project/gpiod/) and more)
+* Compatible with 3rd party libraries ([C](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git/tree/README), [Rust](https://crates.io/crates/gpiod), [Python](https://pypi.org/project/gpiod/) and more)
 * Supported operations:
   * Get a value
   * Set a value
@@ -60,7 +59,7 @@ The recommended order to launch everything is:
 
 ### Interaction
 The CPC Secondary is seen as a GPIO chip (`/dev/gpiochip*`).<br />
-To get started, you can use userspace tools such as [gpiod](https://www.acmesystems.it/gpiod) to interact with the GPIO's.<br/>
+To get started, you can use userspace tools such as [gpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git/tree/README) to interact with the GPIO's.<br/>
 If you wish to do this programatically, there are 3rd party libraries available as highlighted in the [features](#features) section.
 
 ### Modification
@@ -71,9 +70,6 @@ There should never be a need to unload/load the CPC GPIO Driver as it handles de
 
 ### Interrupts
 Interrupts are currently not implemented. One must use polling mechanisms as a workaround.
-
-### Multiple expanders
-Multiple CPC GPIO Expanders per host are currently not implemented. This means a system running multiple instances of CPC Daemon may only expose one CPC GPIO Secondary.
 
 ## Considerations
 

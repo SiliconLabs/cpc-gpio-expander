@@ -1,6 +1,6 @@
 # CPC GPIO Bridge
 
-The CPC GPIO Bridge is a component part of the [CPC GPIO Expander](../README.md) and acts as a router for the [CPC GPIO Driver](../bridge/README.md) and [CPC GPIO Secondary](../secondary/README.md).
+The CPC GPIO Bridge is a component part of the [CPC GPIO Expander](../README.md) and acts as a router for the [CPC GPIO Driver](../driver/README.md) and [CPC GPIO Secondary](../secondary/README.md).
 
 ## Table of Contents
 - [Installation](#installation)
@@ -11,23 +11,11 @@ The CPC GPIO Bridge is a component part of the [CPC GPIO Expander](../README.md)
 
 ## Installation
 
-### Dependencies ##
+### Dependencies
 * [Rust](https://www.rust-lang.org/tools/install)
 * [Libcpc-rs](https://github.com/SiliconLabs/cpc-daemon/tree/main/lib/bindings/rust)
 
 ### Building
-Update the location of the `libcpc` Rust bindings crate in `Cargo.toml`.<br />
-
-This may be a path:
-```
-libcpc = { path = "../../cpc/daemon/lib/bindings/rust" }
-```
-Or a git repository:
-```
-libcpc = { git = "https://github.com/SiliconLabs/cpc-daemon.git" }
-```
-See [The Cargo Book](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) for more details.
-
 Now the Bridge can be built using [cargo build](https://doc.rust-lang.org/cargo/commands/cargo-build.html) and installed with [cargo install]((https://doc.rust-lang.org/cargo/commands/cargo-install.html)):
 
 ```

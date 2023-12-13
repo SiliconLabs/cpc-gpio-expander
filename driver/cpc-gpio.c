@@ -7,17 +7,17 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/module.h>
 #include <linux/gpio/driver.h>
 #include <linux/list.h>
-#include <linux/platform_device.h>
 #include <linux/string_helpers.h>
 #include <net/genetlink.h>
 #include <uapi/linux/gpio.h>
 
-/* Driver API version */
-#define CPC_GPIO_API_VERSION_MAJOR 1
-#define CPC_GPIO_API_VERSION_MINOR 0
-#define CPC_GPIO_API_VERSION_PATCH 0
+/* Driver version */
+#define CPC_GPIO_VERSION_MAJOR 1
+#define CPC_GPIO_VERSION_MINOR 1
+#define CPC_GPIO_VERSION_PATCH 0
 
 /* Driver Name */
 #define CPC_GPIO_DRIVER_NAME "cpc-gpio"
@@ -36,9 +36,6 @@
 #define CPC_GPIO_TIMEOUT_SECONDS 2
 #define CPC_GPIO_TIMEOUT_MSEC (CPC_GPIO_TIMEOUT_SECONDS * 1000)
 
-/* Maximum number of properties + the sentinel */
-#define CPC_GPIO_DEVICE_MAX_PROP (4 + 1)
-
 /* GPIO is disabled */
 #define GPIO_LINE_DIRECTION_DISABLED 2
 
@@ -51,10 +48,14 @@ struct cpc_gpio_line {
 
 struct cpc_gpio_chip {
   u64 uid;
+  bool initialized;
+  bool registered;
   struct cpc_gpio_line *lines;
-  struct platform_device *pdev;
   struct gpio_chip gc;
+  char **gpio_names;
+  u16 gpio_count;
   struct mutex lock;
+  struct cpc_gpio_chip_list_item *list_item;
 };
 
 struct cpc_gpio_chip_list_item {
@@ -100,8 +101,7 @@ enum cpc_status_t {
   CPC_STATUS_UNKNOWN = UINT_MAX,
 };
 
-static int cpc_gpio_probe(struct platform_device *pdev);
-
+/* Netlink callbacks */
 int cpc_gpio_genl_callback_init(struct sk_buff *sender_skb,
                                 struct genl_info *info);
 int cpc_gpio_genl_callback_deinit(struct sk_buff *sender_skb,
@@ -115,21 +115,42 @@ int cpc_gpio_genl_callback_set_gpio_config(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_set_gpio_direction(struct sk_buff *sender_skb,
                                               struct genl_info *info);
 
-// GPIO Driver
-static const struct of_device_id cpc_gpio_of_match[] = {
-  {
-    .compatible = CPC_GPIO_DRIVER_NAME,
-  },
-  {},
-};
-MODULE_DEVICE_TABLE(of, cpc_gpio_of_match);
-static struct platform_driver cpc_gpio_driver = {
-  .driver = {
-    .name = CPC_GPIO_DRIVER_NAME,
-    .of_match_table = cpc_gpio_of_match,
-  },
-  .probe = cpc_gpio_probe,
-};
+/* Netlink multicast functions */
+static int cpc_gpio_multicast_get_gpio_value(u64 uid, unsigned int pin);
+static int cpc_gpio_multicast_set_gpio_value(u64 uid, unsigned int pin,
+                                             unsigned int value);
+static int cpc_gpio_multicast_set_gpio_config(u64 uid, unsigned int pin, unsigned int config);
+static int cpc_gpio_multicast_set_gpio_direction(u64 uid, unsigned int pin, unsigned int direction);
+static int cpc_gpio_multicast_exit(const char *exit_message);
+
+/* Callbacks for gpiolib */
+static int cpc_gpio_get(struct gpio_chip *gc, unsigned int pin);
+static void cpc_gpio_set(struct gpio_chip *gc, unsigned int pin, int value);
+static int cpc_gpio_direction_output(struct gpio_chip *gc, unsigned int pin, int value);
+static int cpc_gpio_direction_input(struct gpio_chip *gc, unsigned int pin);
+static int cpc_gpio_get_direction(struct gpio_chip *gc, unsigned int pin);
+static int cpc_gpio_set_config(struct gpio_chip *gc, unsigned int pin,
+                               unsigned long config);
+static void cpc_gpio_free(struct gpio_chip *gc, unsigned int pin);
+
+/* Internal functions */
+static int cpc_gpio_direction_disabled(struct gpio_chip *gc, unsigned int pin);
+static struct cpc_gpio_chip* cpc_find_chip(u64 uid);
+static int cpc_register_chip(struct cpc_gpio_chip *chip);
+static int cpc_status_to_errno(enum cpc_status_t status);
+
+/* Internal functions that require careful locking */
+static struct cpc_gpio_chip* __cpc_find_chip(u64 uid);
+static void __cpc_free_chip(struct cpc_gpio_chip *chip);
+static void __cpc_unregister_chip(struct cpc_gpio_chip *chip);
+static bool __cpc_gpiochip_is_requested(struct cpc_gpio_chip *chip);
+static int __cpc_gpio_get(struct cpc_gpio_chip *chip, unsigned int pin);
+static int __cpc_gpio_set(struct cpc_gpio_chip *chip, unsigned int pin,
+                          int value);
+static int __cpc_gpio_set_config(struct gpio_chip *gc, unsigned int pin,
+                                 int config);
+static int ____cpc_gpio_set_config(struct cpc_gpio_chip *chip, unsigned int pin,
+                                   int config);
 
 // GPIO Chip List
 static LIST_HEAD(cpc_gpio_chip_list);
@@ -137,33 +158,29 @@ static LIST_HEAD(cpc_gpio_chip_list);
 // GPIO Chip List Lock
 static DEFINE_MUTEX(cpc_gpio_chip_list_lock);
 
-static bool cpc_empty_chip_list(void)
-{
-  bool empty = false;
-
-  mutex_lock(&cpc_gpio_chip_list_lock);
-
-  empty = list_empty(&cpc_gpio_chip_list);
-
-  mutex_unlock(&cpc_gpio_chip_list_lock);
-
-  return empty;
-}
-
-static struct cpc_gpio_chip** cpc_find_chip(u64 uid)
+static struct cpc_gpio_chip* __cpc_find_chip(u64 uid)
 {
   struct cpc_gpio_chip_list_item *list_item = NULL;
-  struct cpc_gpio_chip** chip = NULL;
-
-  mutex_lock(&cpc_gpio_chip_list_lock);
+  struct cpc_gpio_chip *chip = NULL;
 
   list_for_each_entry(list_item, &cpc_gpio_chip_list, list)
   {
     if (list_item->chip->uid == uid) {
-      chip = &list_item->chip;
+      chip = list_item->chip;
       break;
     }
   }
+
+  return chip;
+}
+
+static struct cpc_gpio_chip* cpc_find_chip(u64 uid)
+{
+  struct cpc_gpio_chip *chip = NULL;
+
+  mutex_lock(&cpc_gpio_chip_list_lock);
+
+  chip = __cpc_find_chip(uid);
 
   mutex_unlock(&cpc_gpio_chip_list_lock);
 
@@ -174,11 +191,14 @@ static int cpc_register_chip(struct cpc_gpio_chip *chip)
 {
   struct cpc_gpio_chip_list_item *list_item;
 
+  pr_info("%s: uid: %llu\n", __func__, chip->uid);
+
   list_item = kzalloc(sizeof(*list_item), GFP_KERNEL);
   if (!list_item) {
     return -ENOMEM;
   }
 
+  chip->list_item = list_item;
   list_item->chip = chip;
   INIT_LIST_HEAD(&list_item->list);
 
@@ -188,32 +208,48 @@ static int cpc_register_chip(struct cpc_gpio_chip *chip)
 
   mutex_unlock(&cpc_gpio_chip_list_lock);
 
-  pr_info("%s: uid: %llu\n", __func__, chip->uid);
-
   return 0;
 }
 
-static void cpc_unregister_chip(struct cpc_gpio_chip **chip_ptr)
+static void __cpc_free_chip(struct cpc_gpio_chip *chip)
 {
-  struct platform_device *pdev;
-  struct fwnode_handle *fwnode;
-  struct cpc_gpio_chip_list_item *list_item;
-  struct cpc_gpio_chip *chip = *chip_ptr;
-
-  mutex_lock(&cpc_gpio_chip_list_lock);
-
-  pdev = chip->pdev;
-  fwnode = dev_fwnode(&pdev->dev);
-  platform_device_unregister(pdev);
-  fwnode_remove_software_node(fwnode);
-
-  list_item = container_of(chip_ptr, struct cpc_gpio_chip_list_item, chip);
-  list_del(&list_item->list);
-  kfree(list_item);
-
-  mutex_unlock(&cpc_gpio_chip_list_lock);
+  int i;
 
   pr_info("%s: uid: %llu\n", __func__, chip->uid);
+
+  kfree(chip->lines);
+
+  for (i = 0; i < chip->gpio_count; i++) {
+    kfree(chip->gpio_names[i]);
+  }
+  kfree(chip->gpio_names);
+
+  mutex_destroy(&chip->lock);
+
+  kfree(chip);
+}
+
+static void __cpc_unregister_chip(struct cpc_gpio_chip *chip)
+{
+  pr_info("%s: uid: %llu\n", __func__, chip->uid);
+
+  gpiochip_remove(&chip->gc);
+
+  chip->registered = false;
+}
+
+static bool __cpc_gpiochip_is_requested(struct cpc_gpio_chip *chip)
+{
+  int i;
+
+  for (i = 0; i < chip->gc.ngpio; i++) {
+    if (gpiochip_is_requested(&chip->gc, i)) {
+      pr_err("%s: uid: %llu, gpio pin %d is still requested\n", __func__, chip->uid, i);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static struct nla_policy cpc_gpio_genl_policy[__CPC_GPIO_GENL_ATTR_MAX] = {
@@ -300,56 +336,105 @@ static int cpc_status_to_errno(enum cpc_status_t status)
   }
 }
 
-static int cpc_gpio_register_chip(u64 uid, char* chip_label, u16 ngpio, char** gpio_names)
+static int cpc_gpio_register_chip(u64 uid, char *chip_label, u16 ngpio, char **gpio_names)
 {
-  struct property_entry properties[CPC_GPIO_DEVICE_MAX_PROP];
-  struct platform_device_info pdevinfo;
-  struct fwnode_handle *fwnode;
-  int prop = 0;
-  int err = 0;
+  struct cpc_gpio_chip *chip;
+  int ret;
+  int i;
 
-  if (!cpc_empty_chip_list()) {
-    pr_err("%s: only one chip can be registered\n", __func__);
-    err = -EPERM;
-    return err;
+  mutex_lock(&cpc_gpio_chip_list_lock);
+
+  chip = __cpc_find_chip(uid);
+  if (chip) {
+    if (chip->initialized) {
+      pr_err("%s: only one chip per uid can be initialized\n", __func__);
+      mutex_unlock(&cpc_gpio_chip_list_lock);
+      ret = -EPERM;
+      goto free_gpio_names;
+    } else if (chip->registered) {
+      pr_err("%s: the chip must first be unregistered\n", __func__);
+      mutex_unlock(&cpc_gpio_chip_list_lock);
+      ret = -EBUSY;
+      goto free_gpio_names;
+    } else {
+      list_del(&chip->list_item->list);
+      kfree(chip->list_item);
+      __cpc_free_chip(chip);
+    }
   }
 
-  memset(properties, 0, sizeof(properties));
-  memset(&pdevinfo, 0, sizeof(pdevinfo));
+  mutex_unlock(&cpc_gpio_chip_list_lock);
 
-  // Unique Id
-  properties[prop++] = PROPERTY_ENTRY_U64("uid", uid);
-
-  // Chip label
-  properties[prop++] = PROPERTY_ENTRY_STRING("chip-label", chip_label);
-
-  // GPIO count: "ngpios" is a reserved property
-  properties[prop++] = PROPERTY_ENTRY_U16("ngpios", ngpio);
-
-  // GPIO names: "gpio-line-names" is a reserved property
-  properties[prop++] = PROPERTY_ENTRY_STRING_ARRAY_LEN("gpio-line-names",
-                                                       gpio_names, ngpio);
-
-  fwnode = fwnode_create_software_node(properties, NULL);
-  err = IS_ERR(fwnode);
-  if (err) {
-    pr_err("%s: fwnode_create_software_node failed: %d\n", __func__, err);
-    return err;
+  chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+  if (!chip) {
+    ret = -ENOMEM;
+    goto free_gpio_names;
   }
 
-  pdevinfo.name = CPC_GPIO_DRIVER_NAME;
-  pdevinfo.id = PLATFORM_DEVID_AUTO;
-  pdevinfo.fwnode = fwnode;
+  chip->gpio_names = gpio_names;
+  chip->gpio_count = ngpio;
 
-  // `cpc_gpio_probe` is called within `platform_device_register_full`
-  err = IS_ERR(platform_device_register_full(&pdevinfo));
-  if (err) {
-    pr_err("%s: platform_device_register_full failed: %d\n", __func__, err);
-    fwnode_remove_software_node(fwnode);
-    return err;
+  mutex_init(&chip->lock);
+
+  // Context
+  chip->uid = uid;
+  chip->gc.label = chip_label;
+  chip->gc.base = -1;
+  chip->gc.names = (const char * const *) gpio_names;
+  chip->gc.ngpio = ngpio;
+  chip->gc.owner = THIS_MODULE;
+  chip->gc.get = cpc_gpio_get;
+  chip->gc.set = cpc_gpio_set;
+  chip->gc.direction_output = cpc_gpio_direction_output;
+  chip->gc.direction_input = cpc_gpio_direction_input;
+  chip->gc.get_direction = cpc_gpio_get_direction;
+  chip->gc.set_config = cpc_gpio_set_config;
+  chip->gc.free = cpc_gpio_free;
+
+  chip->lines = kcalloc(chip->gc.ngpio, sizeof(*chip->lines), GFP_KERNEL);
+  if (!chip->lines) {
+    ret = -ENOMEM;
+    goto free_chip;
   }
 
-  return err;
+  for (i = 0; i < chip->gc.ngpio; i++) {
+    chip->lines[i].direction = GPIO_LINE_DIRECTION_IN;
+    sema_init(&chip->lines[i].signal, 0);
+  }
+
+  chip->initialized = true;
+
+  ret = gpiochip_add_data(&chip->gc, chip);
+  if (ret) {
+    goto free_lines;
+  }
+
+  ret = cpc_register_chip(chip);
+  if (ret) {
+    goto remove_gpiochip;
+  }
+
+  chip->registered = true;
+
+  return ret;
+
+  remove_gpiochip:
+  gpiochip_remove(&chip->gc);
+
+  free_lines:
+  kfree(chip->lines);
+
+  free_chip:
+  mutex_destroy(&chip->lock);
+  kfree(chip);
+
+  free_gpio_names:
+  for (i = 0; i < ngpio; i++) {
+    kfree(gpio_names[i]);
+  }
+  kfree(gpio_names);
+
+  return ret;
 }
 
 static int cpc_gpio_multicast_get_gpio_value(u64 uid, unsigned int pin)
@@ -695,6 +780,16 @@ int cpc_gpio_genl_callback_init(struct sk_buff *sender_skb,
     gpio_count = nla_get_u32(na);
   }
 
+  na = info->attrs[CPC_GPIO_GENL_ATTR_CHIP_LABEL];
+  if (!na) {
+    pr_err("%s: No info->attrs[%d]\n", __func__,
+           CPC_GPIO_GENL_ATTR_CHIP_LABEL);
+    err = -EINVAL;
+    goto done;
+  } else {
+    chip_label = nla_data(na);
+  }
+
   na = info->attrs[CPC_GPIO_GENL_ATTR_GPIO_NAMES];
   if (!na) {
     pr_err("%s: No info->attrs[%d]\n", __func__,
@@ -715,38 +810,34 @@ int cpc_gpio_genl_callback_init(struct sk_buff *sender_skb,
 
     for (i = 0; i < gpio_count; i++) {
       len = strlen(raw_names) + 1;
-      gpio_names[gpio_name_count] = raw_names;
+      gpio_names[gpio_name_count] = kzalloc(len, GFP_KERNEL);
+      if (!gpio_names[gpio_name_count]) {
+        pr_err("%s: kzalloc failed\n", __func__);
+        err = -ENOMEM;
+        break;
+      }
+      memcpy(gpio_names[gpio_name_count], raw_names, len);
       raw_names = raw_names + len;
       gpio_name_count++;
     }
 
     if (gpio_count != gpio_name_count) {
       pr_err("%s: gpio_count != gpio_name_count\n", __func__);
-      err = -EINVAL;
+      for (i = 0; i < gpio_count; i++) {
+        kfree(gpio_names[i]);
+      }
+      kfree(gpio_names);
+      if (!err) {
+        err = -EINVAL;
+      }
       goto done;
     }
   }
 
-  na = info->attrs[CPC_GPIO_GENL_ATTR_CHIP_LABEL];
-  if (!na) {
-    pr_err("%s: No info->attrs[%d]\n", __func__,
-           CPC_GPIO_GENL_ATTR_CHIP_LABEL);
-    err = -EINVAL;
-    goto done;
-  } else {
-    chip_label = nla_data(na);
-  }
-
   // Register chip
   err = cpc_gpio_register_chip(uid, chip_label, gpio_count, gpio_names);
-  if (err) {
-    goto done;
-  }
 
   done:
-  // 0) Cleanup
-  kfree(gpio_names);
-
   // 1) Prepare message.
   reply_skb = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
   if (!reply_skb) {
@@ -792,12 +883,10 @@ int cpc_gpio_genl_callback_init(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_deinit(struct sk_buff *sender_skb,
                                   struct genl_info *info)
 {
-  struct cpc_gpio_chip **chip_ptr = NULL;
   struct cpc_gpio_chip *chip = NULL;
   struct nlattr *na = NULL;
   struct sk_buff *reply_skb = NULL;
   void *msg_head = NULL;
-  int i = 0;
   s32 err = 0;
   s32 nl_err = 0;
   u64 uid = 0;
@@ -814,20 +903,25 @@ int cpc_gpio_genl_callback_deinit(struct sk_buff *sender_skb,
     uid = nla_get_u64(na);
   }
 
-  chip_ptr = cpc_find_chip(uid);
-  if (chip_ptr) {
-    chip = *chip_ptr;
-    for (i = 0; i < chip->gc.ngpio; i++) {
-      if (gpiochip_is_requested(&chip->gc, i)) {
-        pr_err("%s: failed to deinit, gpio pin %d is still requested\n",
-               __func__, i);
-        err = -EBUSY;
+  mutex_lock(&cpc_gpio_chip_list_lock);
+
+  chip = __cpc_find_chip(uid);
+  if (chip) {
+    if (chip->registered) {
+      mutex_lock(&chip->lock);
+      chip->initialized = false;
+      if (__cpc_gpiochip_is_requested(chip)) {
+        mutex_unlock(&chip->lock);
+        mutex_unlock(&cpc_gpio_chip_list_lock);
+        err = -EPERM;
         goto done;
       }
+      __cpc_unregister_chip(chip);
+      mutex_unlock(&chip->lock);
     }
-
-    cpc_unregister_chip(chip_ptr);
   }
+
+  mutex_unlock(&cpc_gpio_chip_list_lock);
 
   done:
   // 1) Prepare message.
@@ -848,21 +942,21 @@ int cpc_gpio_genl_callback_deinit(struct sk_buff *sender_skb,
   }
 
   // 2) Set message.
-  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_MAJOR, CPC_GPIO_API_VERSION_MAJOR);
+  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_MAJOR, CPC_GPIO_VERSION_MAJOR);
   if (nl_err != 0) {
     pr_err("%s: nla_put_u8 failed: %d\n", __func__, nl_err);
     err = nl_err;
     goto genl_error;
   }
 
-  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_MINOR, CPC_GPIO_API_VERSION_MINOR);
+  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_MINOR, CPC_GPIO_VERSION_MINOR);
   if (nl_err != 0) {
     pr_err("%s: nla_put_u8 failed: %d\n", __func__, nl_err);
     err = nl_err;
     goto genl_error;
   }
 
-  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_PATCH, CPC_GPIO_API_VERSION_PATCH);
+  nl_err = nla_put_u8(reply_skb, CPC_GPIO_GENL_ATTR_VERSION_PATCH, CPC_GPIO_VERSION_PATCH);
   if (nl_err != 0) {
     pr_err("%s: nla_put_u8 failed: %d\n", __func__, nl_err);
     err = nl_err;
@@ -898,9 +992,8 @@ int cpc_gpio_genl_callback_deinit(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_get_gpio_value(struct sk_buff *sender_skb,
                                           struct genl_info *info)
 {
-  struct cpc_gpio_chip **chip_ptr;
-  struct cpc_gpio_chip *chip;
-  struct nlattr *na;
+  struct cpc_gpio_chip *chip = NULL;
+  struct nlattr *na = NULL;
   u32 gpio_pin;
   u32 gpio_value;
   u32 status;
@@ -920,12 +1013,10 @@ int cpc_gpio_genl_callback_get_gpio_value(struct sk_buff *sender_skb,
     uid = nla_get_u64(na);
   }
 
-  chip_ptr = cpc_find_chip(uid);
-  if (!chip_ptr) {
+  chip = cpc_find_chip(uid);
+  if (!chip) {
     pr_err("%s: chip not found (uid: %llu)\n", __func__, uid);
     return -EINVAL;
-  } else {
-    chip = *chip_ptr;
   }
 
   na = info->attrs[CPC_GPIO_GENL_ATTR_GPIO_PIN];
@@ -968,9 +1059,8 @@ int cpc_gpio_genl_callback_get_gpio_value(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_set_gpio_value(struct sk_buff *sender_skb,
                                           struct genl_info *info)
 {
-  struct cpc_gpio_chip **chip_ptr = NULL;
   struct cpc_gpio_chip *chip = NULL;
-  struct nlattr *na;
+  struct nlattr *na = NULL;
   u32 gpio_pin;
   u32 status;
   u64 uid;
@@ -989,12 +1079,10 @@ int cpc_gpio_genl_callback_set_gpio_value(struct sk_buff *sender_skb,
     uid = nla_get_u64(na);
   }
 
-  chip_ptr = cpc_find_chip(uid);
-  if (!chip_ptr) {
+  chip = cpc_find_chip(uid);
+  if (!chip) {
     pr_err("%s: chip not found (uid: %llu)\n", __func__, uid);
     return -EINVAL;
-  } else {
-    chip = *chip_ptr;
   }
 
   na = info->attrs[CPC_GPIO_GENL_ATTR_GPIO_PIN];
@@ -1025,9 +1113,8 @@ int cpc_gpio_genl_callback_set_gpio_value(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_set_gpio_config(struct sk_buff *sender_skb,
                                            struct genl_info *info)
 {
-  struct cpc_gpio_chip **chip_ptr = NULL;
   struct cpc_gpio_chip *chip = NULL;
-  struct nlattr *na;
+  struct nlattr *na = NULL;
   u32 gpio_pin;
   s32 status;
   u64 uid;
@@ -1046,12 +1133,10 @@ int cpc_gpio_genl_callback_set_gpio_config(struct sk_buff *sender_skb,
     uid = nla_get_u64(na);
   }
 
-  chip_ptr = cpc_find_chip(uid);
-  if (!chip_ptr) {
+  chip = cpc_find_chip(uid);
+  if (!chip) {
     pr_err("%s: chip not found (uid: %llu)\n", __func__, uid);
     return -EINVAL;
-  } else {
-    chip = *chip_ptr;
   }
 
   na = info->attrs[CPC_GPIO_GENL_ATTR_GPIO_PIN];
@@ -1082,9 +1167,8 @@ int cpc_gpio_genl_callback_set_gpio_config(struct sk_buff *sender_skb,
 int cpc_gpio_genl_callback_set_gpio_direction(struct sk_buff *sender_skb,
                                               struct genl_info *info)
 {
-  struct cpc_gpio_chip **chip_ptr = NULL;
   struct cpc_gpio_chip *chip = NULL;
-  struct nlattr *na;
+  struct nlattr *na = NULL;
   u32 gpio_pin;
   s32 status;
   u64 uid;
@@ -1103,12 +1187,10 @@ int cpc_gpio_genl_callback_set_gpio_direction(struct sk_buff *sender_skb,
     uid = nla_get_u64(na);
   }
 
-  chip_ptr = cpc_find_chip(uid);
-  if (!chip_ptr) {
+  chip = cpc_find_chip(uid);
+  if (!chip) {
     pr_err("%s: chip not found (uid: %llu)\n", __func__, uid);
     return -EINVAL;
-  } else {
-    chip = *chip_ptr;
   }
 
   na = info->attrs[CPC_GPIO_GENL_ATTR_GPIO_PIN];
@@ -1139,14 +1221,14 @@ int cpc_gpio_genl_callback_set_gpio_direction(struct sk_buff *sender_skb,
 static int __cpc_gpio_get(struct cpc_gpio_chip *chip, unsigned int pin)
 {
   int ret = -EPIPE;
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   cpc_gpio_multicast_get_gpio_value(chip->uid, pin);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
-    pr_debug("%s: pin = %d, value = %d, status = %d\n", __func__, pin,
+    pr_debug("%s: uid = %llu, pin = %d, value = %d, status = %d\n", __func__, chip->uid, pin,
              chip->lines[pin].value, chip->lines[pin].status);
     ret = cpc_status_to_errno(chip->lines[pin].status);
     if (ret == CPC_STATUS_OK) {
@@ -1163,7 +1245,14 @@ static int cpc_gpio_get(struct gpio_chip *gc, unsigned int pin)
   int value;
 
   mutex_lock(&chip->lock);
+
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
   value = __cpc_gpio_get(chip, pin);
+
   mutex_unlock(&chip->lock);
 
   return value;
@@ -1173,15 +1262,15 @@ static int __cpc_gpio_set(struct cpc_gpio_chip *chip, unsigned int pin,
                           int value)
 {
   int ret = -EPIPE;
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   cpc_gpio_multicast_set_gpio_value(chip->uid, pin, value);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
     chip->lines[pin].value = value;
-    pr_debug("%s: pin = %d, value = %d, status = %d\n", __func__, pin,
+    pr_debug("%s: uid = %llu, pin = %d, value = %d, status = %d\n", __func__, chip->uid, pin,
              chip->lines[pin].value, chip->lines[pin].status);
     ret = cpc_status_to_errno(chip->lines[pin].status);
   }
@@ -1194,22 +1283,29 @@ static void cpc_gpio_set(struct gpio_chip *gc, unsigned int pin, int value)
   struct cpc_gpio_chip *chip = gpiochip_get_data(gc);
 
   mutex_lock(&chip->lock);
+
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return;
+  }
+
   __cpc_gpio_set(chip, pin, value);
+
   mutex_unlock(&chip->lock);
 }
 
-static int __cpc_gpio_set_config(struct cpc_gpio_chip *chip, unsigned int pin,
-                                 int config)
+static int ____cpc_gpio_set_config(struct cpc_gpio_chip *chip, unsigned int pin,
+                                   int config)
 {
   int ret = -EPIPE;
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   cpc_gpio_multicast_set_gpio_config(chip->uid, pin, config);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
-    pr_debug("%s: pin = %d, config = %d, status = %d\n", __func__, pin,
+    pr_debug("%s: uid = %llu, pin = %d, config = %d, status = %d\n", __func__, chip->uid, pin,
              config, chip->lines[pin].status);
     ret = cpc_status_to_errno(chip->lines[pin].status);
   }
@@ -1217,14 +1313,21 @@ static int __cpc_gpio_set_config(struct cpc_gpio_chip *chip, unsigned int pin,
   return ret;
 }
 
-static int _cpc_gpio_set_config(struct gpio_chip *gc, unsigned int pin,
-                                int value)
+static int __cpc_gpio_set_config(struct gpio_chip *gc, unsigned int pin,
+                                 int config)
 {
   struct cpc_gpio_chip *chip = gpiochip_get_data(gc);
   int err;
 
   mutex_lock(&chip->lock);
-  err = __cpc_gpio_set_config(chip, pin, value);
+
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
+  err = ____cpc_gpio_set_config(chip, pin, config);
+
   mutex_unlock(&chip->lock);
 
   return err;
@@ -1237,18 +1340,18 @@ static int cpc_gpio_set_config(struct gpio_chip *gc, unsigned int pin,
 
   switch (config_param) {
     case PIN_CONFIG_BIAS_DISABLE:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
     case PIN_CONFIG_BIAS_PULL_DOWN:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
     case PIN_CONFIG_BIAS_PULL_UP:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
 
     case PIN_CONFIG_DRIVE_OPEN_DRAIN:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
     case PIN_CONFIG_DRIVE_OPEN_SOURCE:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
     case PIN_CONFIG_DRIVE_PUSH_PULL:
-      return _cpc_gpio_set_config(gc, pin, config_param);
+      return __cpc_gpio_set_config(gc, pin, config_param);
 
     case PIN_CONFIG_PERSIST_STATE:
       return 0;
@@ -1264,18 +1367,23 @@ static int cpc_gpio_direction_disabled(struct gpio_chip *gc, unsigned int pin)
   int ret = -EPIPE;
   int direction = GPIO_LINE_DIRECTION_DISABLED;
   struct cpc_gpio_chip *chip = gpiochip_get_data(gc);
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   mutex_lock(&chip->lock);
 
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
   cpc_gpio_multicast_set_gpio_direction(chip->uid, pin, direction);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
-    chip->lines[pin].direction = direction;
-    pr_debug("%s: pin = %d, direction = %d, status = %d\n", __func__, pin,
-             chip->lines[pin].direction, chip->lines[pin].status);
+    chip->lines[pin].direction = GPIO_LINE_DIRECTION_IN;
+    pr_debug("%s: uid = %llu, pin = %d, direction = %d, status = %d\n", __func__, chip->uid, pin,
+             direction, chip->lines[pin].status);
     ret = cpc_status_to_errno(chip->lines[pin].status);
   }
 
@@ -1289,18 +1397,23 @@ static int cpc_gpio_direction_output(struct gpio_chip *gc, unsigned int pin, int
   int ret = -EPIPE;
   int direction = GPIO_LINE_DIRECTION_OUT;
   struct cpc_gpio_chip *chip = gpiochip_get_data(gc);
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   mutex_lock(&chip->lock);
 
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
   cpc_gpio_multicast_set_gpio_direction(chip->uid, pin, direction);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
     int ret_gpio_direction;
     chip->lines[pin].direction = direction;
-    pr_debug("%s: pin = %d, direction = %d, status = %d\n", __func__, pin,
+    pr_debug("%s: uid = %llu, pin = %d, direction = %d, status = %d\n", __func__, chip->uid, pin,
              chip->lines[pin].direction, chip->lines[pin].status);
     ret_gpio_direction = cpc_status_to_errno(chip->lines[pin].status);
     if (ret_gpio_direction != CPC_STATUS_OK) {
@@ -1320,17 +1433,22 @@ static int cpc_gpio_direction_input(struct gpio_chip *gc, unsigned int pin)
   int ret = -EPIPE;
   int direction = GPIO_LINE_DIRECTION_IN;
   struct cpc_gpio_chip *chip = gpiochip_get_data(gc);
+  unsigned long timeout = msecs_to_jiffies(CPC_GPIO_TIMEOUT_MSEC);
 
   mutex_lock(&chip->lock);
 
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
   cpc_gpio_multicast_set_gpio_direction(chip->uid, pin, direction);
 
-  if (down_timeout(&chip->lines[pin].signal,
-                   CPC_GPIO_TIMEOUT_SECONDS * HZ) != 0) {
-    pr_err("%s: cpc-gpio-bridge is unresponsive\n", __func__);
+  if (down_timeout(&chip->lines[pin].signal, timeout) != 0) {
+    pr_err("%s: cpc-gpio-bridge (uid: %llu) is unresponsive\n", __func__, chip->uid);
   } else {
     chip->lines[pin].direction = direction;
-    pr_debug("%s: pin = %d, direction = %d, status = %d\n", __func__, pin,
+    pr_debug("%s: uid = %llu, pin = %d, direction = %d, status = %d\n", __func__, chip->uid, pin,
              chip->lines[pin].direction, chip->lines[pin].status);
     ret = cpc_status_to_errno(chip->lines[pin].status);
   }
@@ -1346,7 +1464,14 @@ static int cpc_gpio_get_direction(struct gpio_chip *gc, unsigned int pin)
   int direction;
 
   mutex_lock(&chip->lock);
+
+  if (!chip->initialized) {
+    mutex_unlock(&chip->lock);
+    return -ENODEV;
+  }
+
   direction = chip->lines[pin].direction;
+
   mutex_unlock(&chip->lock);
 
   return direction;
@@ -1358,102 +1483,20 @@ static void cpc_gpio_free(struct gpio_chip *gc, unsigned int pin)
   cpc_gpio_direction_disabled(gc, pin);
 }
 
-static int cpc_gpio_probe(struct platform_device *pdev)
-{
-  struct cpc_gpio_chip *chip;
-  struct gpio_chip *gc;
-  struct device *dev;
-  const char *name;
-  int rv, i;
-  u16 ngpio;
-  u64 uid;
-
-  pr_debug("%s\n", __func__);
-
-  dev = &pdev->dev;
-
-  rv = device_property_read_u64(dev, "uid", &uid);
-  if (rv) {
-    return rv;
-  }
-
-  rv = device_property_read_u16(dev, "ngpios", &ngpio);
-  if (rv) {
-    return rv;
-  }
-
-  rv = device_property_read_string(dev, "chip-label", &name);
-  if (rv) {
-    name = dev_name(dev);
-  }
-
-  chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
-  if (!chip) {
-    return -ENOMEM;
-  }
-
-  // Context
-  chip->uid = uid;
-  chip->pdev = pdev;
-
-  mutex_init(&chip->lock);
-
-  gc = &chip->gc;
-  gc->base = -1;
-  gc->ngpio = ngpio;
-  gc->label = name;
-  gc->owner = THIS_MODULE;
-  gc->parent = dev;
-  gc->get = cpc_gpio_get;
-  gc->set = cpc_gpio_set;
-  gc->direction_output = cpc_gpio_direction_output;
-  gc->direction_input = cpc_gpio_direction_input;
-  gc->get_direction = cpc_gpio_get_direction;
-  gc->set_config = cpc_gpio_set_config;
-  gc->free = cpc_gpio_free;
-
-  chip->lines =
-    devm_kcalloc(dev, gc->ngpio, sizeof(*chip->lines), GFP_KERNEL);
-  if (!chip->lines) {
-    return -ENOMEM;
-  }
-
-  for (i = 0; i < gc->ngpio; i++) {
-    chip->lines[i].direction = GPIO_LINE_DIRECTION_IN;
-    sema_init(&chip->lines[i].signal, 0);
-  }
-
-  rv = devm_gpiochip_add_data(dev, &chip->gc, chip);
-  if (rv) {
-    return rv;
-  }
-
-  return cpc_register_chip(chip);
-}
-
 static int __init cpc_gpio_init(void)
 {
   int err;
 
-  pr_info("%s: Driver API v%d.%d.%d, GENL API v%d\n", __func__, CPC_GPIO_API_VERSION_MAJOR,
-          CPC_GPIO_API_VERSION_MINOR,
-          CPC_GPIO_API_VERSION_PATCH,
+  pr_info("%s: Driver v%d.%d.%d, GENL v%d\n", __func__, CPC_GPIO_VERSION_MAJOR,
+          CPC_GPIO_VERSION_MINOR,
+          CPC_GPIO_VERSION_PATCH,
           CPC_GPIO_GENL_VERSION);
-
-  err = platform_driver_register(&cpc_gpio_driver);
-  if (err) {
-    pr_err("%s: platform_driver_register failed: %d\n", __func__,
-           err);
-    goto done;
-  }
 
   err = genl_register_family(&cpc_gpio_genl_family);
   if (err) {
     pr_err("%s: genl_register_family failed: %d\n", __func__, err);
-    goto done;
   }
 
-  done:
   return err;
 }
 
@@ -1462,6 +1505,7 @@ static void __exit cpc_gpio_exit(void)
   int err;
   struct cpc_gpio_chip_list_item *list_item = NULL;
   struct cpc_gpio_chip_list_item *list_item_tmp = NULL;
+  struct cpc_gpio_chip *chip = NULL;
 
   err = cpc_gpio_multicast_exit("Kernel Driver is no longer loaded");
   if (err != 0) {
@@ -1475,16 +1519,24 @@ static void __exit cpc_gpio_exit(void)
            err);
   }
 
-  platform_driver_unregister(&cpc_gpio_driver);
+  mutex_lock(&cpc_gpio_chip_list_lock);
 
   list_for_each_entry_safe(list_item, list_item_tmp, &cpc_gpio_chip_list, list)
   {
-    cpc_unregister_chip(&list_item->chip);
+    chip = list_item->chip;
+    if (chip->registered) {
+      __cpc_unregister_chip(chip);
+    }
+    list_del(&list_item->list);
+    kfree(list_item);
+    __cpc_free_chip(chip);
   }
 
-  pr_info("%s: Driver API v%d.%d.%d, GENL API v%d\n", __func__, CPC_GPIO_API_VERSION_MAJOR,
-          CPC_GPIO_API_VERSION_MINOR,
-          CPC_GPIO_API_VERSION_PATCH,
+  mutex_unlock(&cpc_gpio_chip_list_lock);
+
+  pr_info("%s: Driver v%d.%d.%d, GENL v%d\n", __func__, CPC_GPIO_VERSION_MAJOR,
+          CPC_GPIO_VERSION_MINOR,
+          CPC_GPIO_VERSION_PATCH,
           CPC_GPIO_GENL_VERSION);
 }
 

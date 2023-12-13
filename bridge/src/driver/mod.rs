@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use neli::{
     consts::{
         nl::{NlmF, NlmFFlags},
@@ -9,6 +9,7 @@ use neli::{
     socket::NlSocketHandle,
     types::{Buffer, GenlBuffer},
 };
+use std::sync::{mpsc, Mutex};
 
 mod packet;
 pub use packet::Exit;
@@ -35,14 +36,14 @@ const GENL_FAMILY_NAME: &str = "CPC_GPIO_GENL";
 const GENL_MULTICAST_FAMILY_NAME: &str = "CPC_GPIO_GENL_M";
 const GENL_MULTICAST_UID_ALL: u64 = 0;
 
-pub struct Driver {
-    pub fd: std::os::fd::RawFd,
-    unicast: NlSocketHandle,
-    multicast: NlSocketHandle,
+pub struct Handle {
+    pub exit: utils::ThreadExit,
+    data_rx: Mutex<mpsc::Receiver<Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>>>,
+    unicast: Mutex<NlSocketHandle>,
     family_id: u16,
 }
 
-impl Driver {
+impl Handle {
     pub fn new(
         deinit_and_exit: bool,
         unique_id: u64,
@@ -76,22 +77,57 @@ impl Driver {
             };
 
         // Connect to generic netlink multicast
-        let multicast = NlSocketHandle::connect(NlFamily::Generic, Some(0), &[multicast_group])?;
-        multicast.nonblock()?;
+        let mut multicast =
+            NlSocketHandle::connect(NlFamily::Generic, Some(0), &[multicast_group])?;
 
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&multicast);
+        let (data_tx, data_rx) = std::sync::mpsc::channel::<
+            Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>,
+        >();
 
-        let mut handle = Self {
-            fd,
-            unicast,
-            multicast,
+        let (mut exit_sender, exit_receiver) = mio::unix::pipe::new()?;
+
+        std::thread::Builder::new()
+            .name("driver".to_string())
+            .spawn(move || loop {
+                let result = (|| -> Result<()> {
+                    let packet = match multicast.recv() {
+                        Ok(packet) => packet.context("Multicast socked was closed")?,
+                        Err(err) => bail!("Failed to read from Multicast socket, Err: {}", err),
+                    };
+
+                    let filtered = match filter_packet(unique_id, &packet) {
+                        Ok(filtered) => filtered,
+                        Err(err) => bail!("Failed to filter packet, Err: {}", err),
+                    };
+
+                    if !filtered {
+                        if let Err(err) = data_tx.send(packet) {
+                            bail!("Failed to send to Driver channel, Err: {}", err)
+                        }
+                    }
+
+                    Ok(())
+                })();
+
+                if let Err(err) = result {
+                    utils::ThreadExit::notify(&mut exit_sender, &format!("{}", err));
+                    return;
+                }
+            })?;
+
+        let handle = Self {
+            exit: utils::ThreadExit {
+                receiver: Mutex::new(exit_receiver),
+            },
+            data_rx: Mutex::new(data_rx),
+            unicast: Mutex::new(unicast),
             family_id,
         };
 
         handle.deinit(unique_id)?;
 
         if deinit_and_exit {
-            bail!(utils::Exit::Context(anyhow!(
+            bail!(utils::ProcessExit::Context(anyhow!(
                 "Deinitialized Kernel Driver (UID: {})",
                 unique_id
             )));
@@ -103,7 +139,7 @@ impl Driver {
     }
 
     pub fn get_gpio_value_reply(
-        &mut self,
+        &self,
         unique_id: u64,
         gpio_pin: u32,
         gpio_value: Option<u32>,
@@ -149,7 +185,7 @@ impl Driver {
     }
 
     pub fn set_gpio_value_reply(
-        &mut self,
+        &self,
         unique_id: u64,
         gpio_pin: u32,
         status: Option<packet::Status>,
@@ -185,7 +221,7 @@ impl Driver {
     }
 
     pub fn set_gpio_config_reply(
-        &mut self,
+        &self,
         unique_id: u64,
         gpio_pin: u32,
         status: Option<packet::Status>,
@@ -221,7 +257,7 @@ impl Driver {
     }
 
     pub fn set_gpio_direction_reply(
-        &mut self,
+        &self,
         unique_id: u64,
         gpio_pin: u32,
         status: Option<packet::Status>,
@@ -256,7 +292,7 @@ impl Driver {
         Ok(())
     }
 
-    pub fn deinit(&mut self, unique_id: u64) -> Result<()> {
+    pub fn deinit(&self, unique_id: u64) -> Result<()> {
         let mut attributes = GenlBuffer::new();
 
         attributes.push(Nlattr::new(
@@ -269,11 +305,10 @@ impl Driver {
         self.send(packet::Command::Deinit, attributes)?;
 
         let packet = self.read_sync()?;
-        let payload = match packet.nl_payload.get_payload() {
-            Some(payload) => payload,
-            None => bail!("No payload from Kernel Driver"),
-        };
-
+        let payload = packet
+            .nl_payload
+            .get_payload()
+            .context("No payload from Kernel Driver")?;
         let genl_version = payload.version;
 
         if GENL_API_VERSION != genl_version {
@@ -301,99 +336,98 @@ impl Driver {
 
         let status = attributes.get_attr_payload_as::<u32>(packet::Attribute::Status)?;
         if status != 0 {
-            bail!("Failed to deinitialize Kernel Driver: Errno(-{})", status);
+            bail!(
+                "Failed to deinitialize Kernel Driver, Err: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            );
         }
 
         Ok(())
     }
 
-    pub fn read(
-        &mut self,
-    ) -> Result<Option<Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>>> {
-        Ok(self.multicast.recv()?)
+    pub fn read(&self) -> Result<Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>> {
+        Ok(self
+            .data_rx
+            .lock()
+            .map_err(|err| anyhow!("{}", err))?
+            .recv()?)
     }
 
     pub fn parse(
-        &mut self,
+        &self,
         packet: Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>,
-        unique_id: u64,
     ) -> Result<packet::Packet> {
         let attributes = packet.get_payload()?.get_attr_handle();
-        let payload = match packet.nl_payload.get_payload() {
-            Some(payload) => payload,
-            None => bail!("No payload from Kernel Driver"),
-        };
+        let payload = packet
+            .nl_payload
+            .get_payload()
+            .context("No payload from Kernel Driver")?;
 
-        let destination = attributes.get_attr_payload_as::<u64>(packet::Attribute::UniqueId)?;
+        match payload.cmd {
+            packet::Command::Exit => {
+                let message = attributes
+                    .get_attr_payload_as_with_len::<String>(packet::Attribute::Message)?;
 
-        match destination {
-            GENL_MULTICAST_UID_ALL => match payload.cmd {
-                packet::Command::Exit => {
-                    let message = attributes
-                        .get_attr_payload_as_with_len::<String>(packet::Attribute::Message)?;
+                Ok(packet::Packet::Exit(packet::Exit { message }))
+            }
+            packet::Command::GetGpioValue => {
+                let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
 
-                    Ok(packet::Packet::Exit(packet::Exit { message }))
-                }
-                _ => bail!("[{:#?}] Unknown command", payload.cmd),
-            },
-            destination if destination == unique_id => match payload.cmd {
-                packet::Command::GetGpioValue => {
-                    let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
+                Ok(packet::Packet::GetGpioValue(packet::GetGpioValue { pin }))
+            }
+            packet::Command::SetGpioValue => {
+                let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
 
-                    Ok(packet::Packet::GetGpioValue(packet::GetGpioValue { pin }))
-                }
-                packet::Command::SetGpioValue => {
-                    let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
+                let value = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioValue)?;
 
-                    let value =
-                        attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioValue)?;
+                let value = packet::GpioValue::try_from(value)?;
 
-                    let value = packet::GpioValue::try_from(value)?;
+                Ok(packet::Packet::SetGpioValue(packet::SetGpioValue {
+                    pin,
+                    value,
+                }))
+            }
+            packet::Command::SetGpioConfig => {
+                let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
 
-                    Ok(packet::Packet::SetGpioValue(packet::SetGpioValue {
-                        pin,
-                        value,
-                    }))
-                }
-                packet::Command::SetGpioConfig => {
-                    let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
+                let config =
+                    attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioConfig)?;
 
-                    let config =
-                        attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioConfig)?;
+                let config = packet::GpioConfig::try_from(config)?;
 
-                    let config = packet::GpioConfig::try_from(config)?;
+                Ok(packet::Packet::SetGpioConfig(packet::SetGpioConfig {
+                    pin,
+                    config,
+                }))
+            }
+            packet::Command::SetGpioDirection => {
+                let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
 
-                    Ok(packet::Packet::SetGpioConfig(packet::SetGpioConfig {
-                        pin,
-                        config,
-                    }))
-                }
-                packet::Command::SetGpioDirection => {
-                    let pin = attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioPin)?;
+                let direction =
+                    attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioDirection)?;
 
-                    let direction =
-                        attributes.get_attr_payload_as::<u32>(packet::Attribute::GpioDirection)?;
+                let direction = packet::GpioDirection::try_from(direction)?;
 
-                    let direction = packet::GpioDirection::try_from(direction)?;
-
-                    Ok(packet::Packet::SetGpioDirection(packet::SetGpioDirection {
-                        pin,
-                        direction,
-                    }))
-                }
-                _ => {
-                    bail!("[{:#?}] Unknown command", payload.cmd);
-                }
-            },
-            _ => Ok(packet::Packet::Discard),
+                Ok(packet::Packet::SetGpioDirection(packet::SetGpioDirection {
+                    pin,
+                    direction,
+                }))
+            }
+            _ => {
+                bail!("[{:#?}] Unknown command", payload.cmd);
+            }
         }
     }
 }
 
-impl Driver {
-    fn init(&mut self, unique_id: u64, chip_label: &str, names: &Vec<String>) -> Result<()> {
-        if names.is_empty() {
-            bail!("GPIO count is {}", names.len());
+impl Handle {
+    fn init(&self, unique_id: u64, label: &str, gpio_names: &Vec<String>) -> Result<()> {
+        if unique_id == GENL_MULTICAST_UID_ALL {
+            bail!("Unique ID cannot be {}", GENL_MULTICAST_UID_ALL);
+        }
+
+        if gpio_names.is_empty() {
+            bail!("GPIO count cannot be {}", gpio_names.len());
         }
 
         let mut attributes = GenlBuffer::new();
@@ -409,21 +443,21 @@ impl Driver {
             false,
             false,
             packet::Attribute::GpioCount,
-            names.len() as u32,
+            gpio_names.len() as u32,
         )?);
 
         attributes.push(Nlattr::new(
             false,
             false,
             packet::Attribute::GpioNames,
-            names.clone(),
+            gpio_names.clone(),
         )?);
 
         attributes.push(Nlattr::new(
             false,
             false,
             packet::Attribute::ChipLabel,
-            chip_label,
+            label,
         )?);
 
         self.send(packet::Command::Init, attributes)?;
@@ -436,14 +470,14 @@ impl Driver {
 
         let args = format!(
             "UID: {:?}, Label: {:?}, GPIO's: {:?}",
-            unique_id, chip_label, names
+            unique_id, label, gpio_names
         );
 
         if status != 0 {
             bail!(
-                "Failed to initialize Kernel Driver ({}), Err: Errno(-{})",
+                "Failed to initialize Kernel Driver ({}), Err: {}",
                 args,
-                status
+                std::io::Error::from_raw_os_error(status as i32)
             );
         } else {
             log::info!("Initialized Kernel Driver ({})", args);
@@ -452,18 +486,18 @@ impl Driver {
         Ok(())
     }
 
-    fn read_sync(
-        &mut self,
-    ) -> Result<Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>> {
-        let buffer = self.unicast.recv()?;
-        match buffer {
-            Some(data) => Ok(data),
-            None => bail!("Nothing to read from Kernel Driver"),
-        }
+    fn read_sync(&self) -> Result<Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>> {
+        let buffer = self
+            .unicast
+            .lock()
+            .map_err(|err| anyhow!("{}", err))?
+            .recv()?;
+
+        Ok(buffer.context("Nothing to read from Kernel Driver")?)
     }
 
     fn send(
-        &mut self,
+        &self,
         cmd: packet::Command,
         attributes: GenlBuffer<packet::Attribute, Buffer>,
     ) -> Result<()> {
@@ -476,8 +510,25 @@ impl Driver {
             NlPayload::Payload(Genlmsghdr::new(cmd, GENL_API_VERSION, attributes)),
         );
 
-        self.unicast.send(nlmsghdr)?;
+        self.unicast
+            .lock()
+            .map_err(|err| anyhow!("{}", err))?
+            .send(nlmsghdr)?;
 
         Ok(())
+    }
+}
+
+fn filter_packet(
+    unique_id: u64,
+    packet: &Nlmsghdr<u16, Genlmsghdr<packet::Command, packet::Attribute>>,
+) -> Result<bool> {
+    let attributes = packet.get_payload()?.get_attr_handle();
+    let destination = attributes.get_attr_payload_as::<u64>(packet::Attribute::UniqueId)?;
+
+    match destination {
+        GENL_MULTICAST_UID_ALL => Ok(false),
+        destination if destination == unique_id => Ok(false),
+        _ => Ok(true),
     }
 }

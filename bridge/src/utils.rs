@@ -1,4 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
+use std::{
+    io::{Read, Write},
+    sync::Mutex,
+};
 use thiserror::Error;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -69,14 +73,35 @@ pub fn trace(config: &Config) -> TraceConfig {
     trace_config
 }
 
+pub fn lock_bridge(path: &std::path::Path) -> Result<file_lock::FileLock> {
+    let lock = if let Ok(lock) = file_lock::FileLock::lock(
+        path,
+        false,
+        file_lock::FileOptions::new().create(true).append(true),
+    ) {
+        lock
+    } else {
+        file_lock::FileLock::lock(path, false, file_lock::FileOptions::new().append(true)).map_err(
+            |err| {
+                anyhow!(
+                    "The bridge lock ({}) cannot be taken. Err: {}",
+                    path.display(),
+                    err
+                )
+            },
+        )?
+    };
+
+    Ok(lock)
+}
+
 #[derive(Error, Debug)]
-pub enum Exit {
+pub enum ProcessExit {
     #[error(transparent)]
     Context(anyhow::Error),
 }
-
 pub fn exit(err: anyhow::Error) -> ! {
-    if let Some(context) = err.downcast_ref::<Exit>() {
+    if let Some(context) = err.downcast_ref::<ProcessExit>() {
         log::info!("{}", context);
         std::process::exit(0);
     } else {
@@ -85,25 +110,33 @@ pub fn exit(err: anyhow::Error) -> ! {
     }
 }
 
-pub fn lock_bridge(path: &std::path::Path) -> Result<file_lock::FileLock> {
-    match file_lock::FileLock::lock(
-        path,
-        false,
-        file_lock::FileOptions::new().create(true).append(true),
-    ) {
-        Ok(lock) => Ok(lock),
-        Err(_) => {
-            match file_lock::FileLock::lock(path, false, file_lock::FileOptions::new().append(true))
-            {
-                Ok(lock) => Ok(lock),
-                Err(err) => {
-                    bail!(
-                        "The bridge lock ({}) cannot be taken. Err: {}",
-                        path.display(),
-                        err
-                    );
-                }
-            }
+#[derive(Debug)]
+pub struct ThreadExit {
+    pub receiver: Mutex<mio::unix::pipe::Receiver>,
+}
+impl ThreadExit {
+    pub fn notify(sender: &mut mio::unix::pipe::Sender, message: &str) {
+        if let Err(err) = sender.write_all(message.as_bytes()) {
+            exit(anyhow!(
+                "{}, Failed to notify thread exit, Err: {}",
+                message,
+                err
+            ));
         }
+    }
+}
+impl std::fmt::Display for ThreadExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut message = String::new();
+
+        let message = match self.receiver.lock() {
+            Ok(mut receiver) => match receiver.read_to_string(&mut message) {
+                Ok(_) => message,
+                Err(err) => err.to_string(),
+            },
+            Err(err) => err.to_string(),
+        };
+
+        write!(f, "{}", message)
     }
 }

@@ -37,7 +37,6 @@ pub enum Packet {
     SetGpioValue(SetGpioValue),
     SetGpioConfig(SetGpioConfig),
     SetGpioDirection(SetGpioDirection),
-    Discard,
 }
 
 #[derive(Debug)]

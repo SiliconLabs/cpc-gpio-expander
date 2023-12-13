@@ -16,7 +16,7 @@ mod tests;
     Debug,
 )]
 #[repr(u8)]
-enum HostCmd {
+pub enum HostCmd {
     GetVersion = 0,
     GetUniqueId = 1,
     GetChipLabel = 2,
@@ -56,7 +56,7 @@ pub struct Header<T: Copy + Clone + std::fmt::Debug> {
     len: u8,
 }
 impl<T: Copy + Clone + std::fmt::Debug> Header<T> {
-    fn new(cmd: T, len: u8) -> Self {
+    pub fn new(cmd: T, len: u8) -> Self {
         Self { cmd, len }
     }
     fn len(packet_len: usize) -> u8 {
@@ -84,7 +84,7 @@ impl<T: Copy + std::fmt::Debug> std::fmt::Debug for Header<T> {
 #[derive(serde::Serialize, Copy, Clone, Debug)]
 #[repr(C, packed)]
 pub struct HostHeader {
-    seq: u8,
+    pub seq: u8,
 }
 impl HostHeader {
     fn new(seq: &mut u8) -> Self {

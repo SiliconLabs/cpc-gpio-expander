@@ -1,2 +1,2 @@
 obj-m := cpc-gpio.o
-EXTRA_CFLAGS := 
+EXTRA_CFLAGS :=
